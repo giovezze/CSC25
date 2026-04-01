@@ -63,6 +63,9 @@ class StaffingRatios:
     rest_stop_spacing_miles: int = 12
     rest_stop_volunteers_per_stop: int = 5
     rest_stop_leads_per_stop: int = 1
+    route_support_model: str = "nested"
+    route_start_spacing_minutes: int = 20
+    registration_lead_minutes: int = 120
 
 
 @dataclass(frozen=True)
@@ -75,6 +78,11 @@ class StaffingEstimate:
     rest_stop_leads: int
     rest_stop_volunteers: int
     registration_volunteers: int
+
+
+ROUTE_SUPPORT_NESTED = "nested"
+ROUTE_SUPPORT_PARTIAL_OVERLAP = "partial_overlap"
+ROUTE_SUPPORT_SEPARATE = "separate"
 
 
 # ------------------------------------------------------------------
@@ -215,16 +223,26 @@ def print_route_candidates(routes: List[RouteCandidate]) -> None:
 
 def estimate_rest_stop_count(
     route_distances_miles: Iterable[float],
+    ratios: StaffingRatios,
     spacing_miles: int = StaffingRatios.rest_stop_spacing_miles,
 ) -> int:
     """Estimate the number of rest stops for a set of routes."""
 
-    total = 0
-    for dist in route_distances_miles:
-        if dist <= 0:
-            continue
-        total += max(1, math.ceil(dist / spacing_miles))
-    return total
+    distances = [dist for dist in route_distances_miles if dist > 0]
+    if not distances:
+        return 0
+
+    longest = max(distances)
+    if ratios.route_support_model == ROUTE_SUPPORT_SEPARATE:
+        return sum(max(1, math.ceil(dist / spacing_miles)) for dist in distances)
+
+    if ratios.route_support_model == ROUTE_SUPPORT_PARTIAL_OVERLAP:
+        overlap = compute_route_overlap_share(distances)
+        extra_distance = (sum(distances) - longest) * (1.0 - overlap) * 0.5
+        effective_distance = longest + extra_distance
+        return max(1, math.ceil(effective_distance / spacing_miles))
+
+    return max(1, math.ceil(longest / spacing_miles))
 
 
 def estimate_sag_vehicles(
@@ -232,11 +250,22 @@ def estimate_sag_vehicles(
 ) -> int:
     """Estimate SAG vehicles needed for the event."""
 
-    base_sag = math.ceil(total_riders / ratios.riders_per_sag)
+    base_sag = max(1, math.ceil(total_riders / ratios.riders_per_sag))
     long_route_count = sum(
         1 for r in routes if r.distance_miles >= ratios.long_route_threshold_miles
     )
-    return max(1, base_sag + long_route_count * ratios.sag_per_long_route)
+
+    route_count = len(routes)
+    if ratios.route_support_model == ROUTE_SUPPORT_SEPARATE:
+        corridor_factor = 1.0 + 0.25 * max(0, route_count - 1)
+    elif ratios.route_support_model == ROUTE_SUPPORT_PARTIAL_OVERLAP:
+        overlap = compute_route_overlap_share([r.distance_miles for r in routes])
+        corridor_factor = 1.0 + (1.0 - overlap) * 0.25 * max(0, route_count - 1)
+    else:
+        corridor_factor = 1.0
+
+    support_sag = math.ceil(base_sag * corridor_factor)
+    return max(1, support_sag + long_route_count * ratios.sag_per_long_route)
 
 
 def estimate_mechanics(
@@ -252,29 +281,72 @@ def estimate_mechanics(
 def estimate_signage_teams(
     routes: List[RouteCandidate], ratios: StaffingRatios
 ) -> int:
-    """Estimate the number of signage teams needed (based on total turns)."""
+    """Estimate the number of signage teams needed."""
 
-    total_turns = sum(r.turn_count for r in routes)
-    return max(1, math.ceil(total_turns / ratios.turns_per_signage_team))
+    if not routes:
+        return 1
+
+    turns = [r.turn_count for r in routes]
+    max_turns = max(turns)
+    total_turns = sum(turns)
+
+    if ratios.route_support_model == ROUTE_SUPPORT_SEPARATE:
+        signage_turns = total_turns
+    elif ratios.route_support_model == ROUTE_SUPPORT_PARTIAL_OVERLAP:
+        overlap = compute_route_overlap_share([r.distance_miles for r in routes])
+        signage_turns = max_turns + int(round((total_turns - max_turns) * (1.0 - overlap)))
+    else:
+        signage_turns = max_turns
+
+    return max(1, math.ceil(signage_turns / ratios.turns_per_signage_team))
+
+
+def select_representative_routes(routes: List[RouteCandidate]) -> List[RouteCandidate]:
+    """Pick the actual final route for each target distance.
+
+    For planning, choose the most demanding candidate per distance so support
+    is sized for the worst-case selected course.
+    """
+
+    best_by_distance: dict[float, RouteCandidate] = {}
+    for route in routes:
+        existing = best_by_distance.get(route.distance_miles)
+        if existing is None or route.turn_count > existing.turn_count:
+            best_by_distance[route.distance_miles] = route
+    return [best_by_distance[dist] for dist in sorted(best_by_distance)]
+
+
+def compute_route_overlap_share(route_distances_miles: Iterable[float]) -> float:
+    """Estimate how much support can be shared across multiple routes."""
+
+    distances = [dist for dist in route_distances_miles if dist > 0]
+    if not distances:
+        return 1.0
+    longest = max(distances)
+    return min(1.0, sum(distances) / (len(distances) * longest))
 
 
 def estimate_registration_volunteers(
-    total_riders: int, ratios: StaffingRatios
+    total_riders: int, routes: List[RouteCandidate], ratios: StaffingRatios
 ) -> int:
-    """Estimate registration volunteers using a flattened arrival window.
+    """Estimate registration volunteers based on staggered start waves.
 
-    This assumes a fraction of riders arrive during a configurable peak window
-    rather than all arriving at once, which produces a more realistic staffing
-    number while still providing a target throughput goal.
+    Longer routes start first and registration opens two hours before the
+    first ride, which spreads arrivals and lowers peak demand.
     """
 
-    peak_riders = max(1, math.ceil(total_riders * ratios.registration_peak_fraction))
-    peak_window_seconds = ratios.registration_peak_window_minutes * 60
-    arrival_rate_rps = peak_riders / peak_window_seconds
+    if total_riders <= 0 or not routes:
+        return 1
 
-    # One station can process `1 / seconds_per_rider` riders per second.
+    wave_count = len(routes)
+    registration_window_minutes = (
+        ratios.registration_lead_minutes
+        + ratios.route_start_spacing_minutes * max(0, wave_count - 1)
+        + ratios.registration_peak_window_minutes
+    )
+    arrival_rate_rps = total_riders / (registration_window_minutes * 60)
+
     station_capacity_rps = 1.0 / ratios.registration_seconds_per_rider
-
     stations_needed = math.ceil(arrival_rate_rps / station_capacity_rps)
     return max(1, stations_needed)
 
@@ -284,20 +356,21 @@ def estimate_staffing(
 ) -> StaffingEstimate:
     """Estimate overall staffing needs for an event given candidate routes."""
 
-    sag_vehicles = estimate_sag_vehicles(total_riders, routes, ratios)
+    selected_routes = select_representative_routes(routes)
+    sag_vehicles = estimate_sag_vehicles(total_riders, selected_routes, ratios)
     hub_mechanics, roving_mechanics, total_mechanics = estimate_mechanics(
         total_riders, sag_vehicles, ratios
     )
-    signage_teams = estimate_signage_teams(routes, ratios)
+    signage_teams = estimate_signage_teams(selected_routes, ratios)
 
     rest_stop_count = estimate_rest_stop_count(
-        [r.distance_miles for r in routes], ratios.rest_stop_spacing_miles
+        [r.distance_miles for r in selected_routes], ratios
     )
     rest_stop_volunteers = rest_stop_count * ratios.rest_stop_volunteers_per_stop
     rest_stop_leads = rest_stop_count * ratios.rest_stop_leads_per_stop
 
     registration_volunteers = estimate_registration_volunteers(
-        total_riders, ratios
+        total_riders, selected_routes, ratios
     )
 
     return StaffingEstimate(
