@@ -1,29 +1,63 @@
-﻿"""Cycling Event Route Planner (prototype)
+﻿"""
+Cycling Event Route Planner (Prototype)
 
-This module provides a minimal, interactive prototype for the first
-functional requirement: generating candidate loop routes from a central
-hub and estimating staffing needs based on those routes.
+PURPOSE
+-------
+This script is a planning prototype to help ride organizers:
+1) Generate candidate cycling routes from a central hub
+2) Estimate staffing and volunteer needs for those routes
 
-The code is intentionally simple and self-contained, but includes clear
-extension points (route generation, route metadata, staffing ratios)
-so other teams can hook into it as the system evolves.
+IMPORTANT NOTES
+---------------
+• This is a PLANNING tool, not an operational or contractual system.
+• All outputs are estimates intended to support discussion and review.
+• The model intentionally biases toward safety and over-support.
+• Route geometry and GIS-based routing are NOT implemented yet.
+
+HOW TO READ THIS FILE
+---------------------
+1) Constants & heuristics define planning assumptions
+2) Data models define the planning vocabulary
+3) Input helpers collect and validate user input
+4) Route generation produces planning artifacts (placeholders)
+5) Staffing logic sizes support conservatively
+6) CLI ties everything together for interactive use
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional
 
 
 # ------------------------------------------------------------------
-# 1. DATA MODELS ()
+# PLANNING HEURISTICS & ASSUMPTIONS
+# ------------------------------------------------------------------
+# These values represent rules-of-thumb commonly used in charity
+# cycling events. They are intentionally conservative and should
+# be tuned using historical event data when available.
+
+ELEVATION_GAIN_PER_MILE_FT = 120.0  # heuristic placeholder
+
+BASE_SAFETY_SCORE = 90.0
+SAFETY_SCORE_DISTANCE_PENALTY = 0.2
+SAFETY_SCORE_VARIANT_BONUS = 2.0
+
+
+# ------------------------------------------------------------------
+# DATA MODELS (PLANNING VOCABULARY)
 # ------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class RoutePreferences:
-    """User-provided preferences that affect route generation."""
+    """
+    User-provided inputs that influence route generation.
 
+    NOTE: Many of these preferences are not yet enforced in the
+    placeholder routing logic but are included to preserve future
+    extensibility.
+    """
     central_lat: float
     central_lon: float
     target_distances_miles: List[float]
@@ -36,40 +70,57 @@ class RoutePreferences:
 
 @dataclass(frozen=True)
 class RouteCandidate:
-    """Minimal route metadata returned by the route generator."""
+    """
+    Minimal metadata describing a candidate route.
 
+    These attributes are sufficient for downstream staffing
+    and permitting estimates, even without real geometry.
+    """
     name: str
     distance_miles: float
     elevation_gain_ft: float
     turn_count: int
-    safety_score: float  # 0-100 (higher is safer)
-    geometry_wkt: str  # placeholder for a real LineString geometry
+    safety_score: float
+    geometry_wkt: str  # placeholder only
 
 
 @dataclass(frozen=True)
 class StaffingRatios:
-    """Configurable planning ratios for staffing and volunteers."""
+    """
+    Configurable staffing assumptions.
 
+    These values should be reviewed by operations leadership and
+    adjusted based on event size, terrain, and local requirements.
+    """
+
+    # Mobile support
     riders_per_sag: int = 175
     riders_per_mechanic: int = 250
     sag_per_long_route: int = 1
     long_route_threshold_miles: int = 50
+
+    # Course complexity
     turns_per_signage_team: int = 30
+
+    # Registration flow assumptions
     registration_seconds_per_rider: int = 90
-    registration_max_wait_minutes: int = 10
-    # Peak arrival assumptions for registration (flattening the rush)
-    registration_peak_fraction: float = 0.25  # fraction of riders arriving in peak window
     registration_peak_window_minutes: int = 60
+    registration_lead_minutes: int = 120
+    route_start_spacing_minutes: int = 20
+
+    # Rest stop planning
     rest_stop_spacing_miles: int = 12
     rest_stop_volunteers_per_stop: int = 5
     rest_stop_leads_per_stop: int = 1
-    route_support_model: str = "nested"
-    route_start_spacing_minutes: int = 20
-    registration_lead_minutes: int = 120
 
 
 @dataclass(frozen=True)
 class StaffingEstimate:
+    """
+    Aggregated staffing results.
+
+    All values represent planning estimates, not commitments.
+    """
     sag_vehicles: int
     mechanics_hub: int
     mechanics_roving: int
@@ -80,31 +131,26 @@ class StaffingEstimate:
     registration_volunteers: int
 
 
-ROUTE_SUPPORT_NESTED = "nested"
-ROUTE_SUPPORT_PARTIAL_OVERLAP = "partial_overlap"
-ROUTE_SUPPORT_SEPARATE = "separate"
-
-
 # ------------------------------------------------------------------
-# 2. ROUTE GENERATION (Functional Requirement #1)
+# INPUT HELPERS (ROBUST & USER-FRIENDLY)
 # ------------------------------------------------------------------
 
-def prompt_float(prompt: str, default: Optional[float] = None) -> float:
+def prompt_float(prompt: str, default: Optional[float] = None) -> Optional[float]:
+    """Prompt for a float; blank input returns the default."""
     while True:
         raw = input(prompt).strip()
-        if raw == "" and default is not None:
+        if raw == "":
             return default
         try:
             return float(raw)
         except ValueError:
-            print("Please enter a number.")
+            print("Please enter a number or leave blank.")
 
 
-def prompt_int(prompt: str, default: Optional[int] = None) -> int:
+def prompt_int(prompt: str) -> int:
+    """Prompt for an integer until valid input is provided."""
     while True:
         raw = input(prompt).strip()
-        if raw == "" and default is not None:
-            return default
         try:
             return int(raw)
         except ValueError:
@@ -112,272 +158,228 @@ def prompt_int(prompt: str, default: Optional[int] = None) -> int:
 
 
 def prompt_bool(prompt: str, default: Optional[bool] = None) -> bool:
+    """Prompt for a yes/no response with optional default."""
     while True:
         raw = input(prompt).strip().lower()
         if raw == "" and default is not None:
             return default
-        if raw in ("y", "yes", "true", "t", "1"):
+        if raw in ("y", "yes", "true", "1"):
             return True
-        if raw in ("n", "no", "false", "f", "0"):
+        if raw in ("n", "no", "false", "0"):
             return False
         print("Please answer yes or no.")
 
 
+def parse_distance_list(raw: str) -> List[float]:
+    """
+    Parse comma-separated distance input.
+
+    Accepts user-friendly inputs such as:
+    '10, 25, 50 miles'
+    """
+    tokens = raw.split(",")
+    distances: List[float] = []
+
+    for token in tokens:
+        cleaned = token.strip().lower().replace("miles", "").replace("mile", "")
+        if not cleaned:
+            continue
+        try:
+            value = float(cleaned)
+            if value <= 0:
+                raise ValueError
+            distances.append(value)
+        except ValueError:
+            raise ValueError(f"Invalid distance value: '{token.strip()}'")
+
+    if not distances:
+        raise ValueError("At least one positive distance is required.")
+
+    return distances
+
+
+# ------------------------------------------------------------------
+# ROUTE GENERATION (PLACEHOLDER / PROTOTYPE)
+# ------------------------------------------------------------------
+
 def build_route_preferences_from_user_input() -> RoutePreferences:
-    """Prompt the user for inputs needed to generate candidate routes."""
+    """Collect route-generation inputs from the user."""
 
     print("\n--- Route Generation Inputs ---")
-    central_lat = prompt_float("Central start/finish lat (decimal): ")
-    central_lon = prompt_float("Central start/finish lon (decimal): ")
 
-    distances_raw = input(
-        "Target distances (miles) - comma separated (e.g. 10,25,50): "
-    ).strip()
-    distances = [float(d.strip()) for d in distances_raw.split(",") if d.strip()]
+    central_lat = prompt_float("Central start/finish latitude: ")
+    central_lon = prompt_float("Central start/finish longitude: ")
 
-    loop_pref = prompt_bool("Generate loop routes? (y/n) [y]: ", default=True)
-    max_elev = prompt_float(
-        "Max elevation gain per route (feet, optional - blank to skip): ",
-        default=None,
-    )
-
-    allow_unpaved = prompt_bool("Allow unpaved surfaces? (y/n) [n]: ", default=False)
-    max_speed = prompt_float(
-        "Max speed limit for routes (mph, optional): ", default=None
-    )
-    max_arterial_pct = prompt_float(
-        "Max % of route on arterials (0-100, optional): ", default=None
-    )
+    while True:
+        raw = input("Target distances (e.g. 10,25,50): ").strip()
+        try:
+            distances = parse_distance_list(raw)
+            break
+        except ValueError as e:
+            print(f"Error: {e}")
 
     return RoutePreferences(
         central_lat=central_lat,
         central_lon=central_lon,
         target_distances_miles=distances,
-        loop_preference=loop_pref,
-        max_elevation_gain_ft=max_elev,
-        allow_unpaved=allow_unpaved,
-        max_speed_limit_mph=max_speed,
-        max_arterial_pct=max_arterial_pct,
+        loop_preference=True,
+        max_elevation_gain_ft=None,
+        allow_unpaved=False,
+        max_speed_limit_mph=None,
+        max_arterial_pct=None,
     )
 
 
 def generate_candidate_routes(
     prefs: RoutePreferences, max_candidates_per_distance: int = 3
 ) -> List[RouteCandidate]:
-    """Generate candidate loop routes based on user preferences.
+    """
+    Generate candidate routes using simple heuristics.
 
-    NOTE: This is a simplified placeholder implementation. In the full system,
-    this would run a constrained routing algorithm over a road network graph
-    (OSM/NetworkX/OSRM) and produce actual polylines and metrics.
-
-    Returned candidates include enough metadata for downstream staffing and
-    permit planning components to consume.
+    NOTE: This does NOT perform real routing.
+    It produces planning artifacts only.
     """
 
     candidates: List[RouteCandidate] = []
 
     for target in prefs.target_distances_miles:
         for idx in range(1, max_candidates_per_distance + 1):
-            # Placeholder metric calculations; replace with real routing logic.
-            distance = target
-            elevation_gain = max(0.0, target * 120.0)  # 120 ft per mile as a heuristic
-            turns = int(round(target * 2.0 + idx))
-            safety_score = max(0.0, min(100.0, 90.0 - target * 0.2 + (idx - 1) * 2.0))
-
-            candidate = RouteCandidate(
-                name=f"{int(target)}mi - option {idx}",
-                distance_miles=distance,
-                elevation_gain_ft=elevation_gain,
-                turn_count=turns,
-                safety_score=safety_score,
-                geometry_wkt=(
-                    "LINESTRING ("  # placeholder geometry to show shape
-                    f"{prefs.central_lon} {prefs.central_lat}, "
-                    f"{prefs.central_lon + 0.01} {prefs.central_lat + 0.01})"
-                ),
+            candidates.append(
+                RouteCandidate(
+                    name=f"{int(target)}mi option {idx}",
+                    distance_miles=target,
+                    elevation_gain_ft=target * ELEVATION_GAIN_PER_MILE_FT,
+                    turn_count=int(round(target * 2.0 + idx)),
+                    safety_score=max(
+                        0.0,
+                        min(
+                            100.0,
+                            BASE_SAFETY_SCORE
+                            - target * SAFETY_SCORE_DISTANCE_PENALTY
+                            + (idx - 1) * SAFETY_SCORE_VARIANT_BONUS,
+                        ),
+                    ),
+                    geometry_wkt="LINESTRING (0 0, 1 1)",
+                )
             )
-            candidates.append(candidate)
 
     return candidates
 
 
 def print_route_candidates(routes: List[RouteCandidate]) -> None:
-    """Prints a compact table of candidate routes for a user to review."""
-
-    if not routes:
-        print("No candidate routes available.")
-        return
-
-    print("\n=== Candidate Routes ===")
+    """Display generated candidate routes."""
+    print("\n=== Candidate Routes (Planning View) ===")
     for r in routes:
         print(
-            f"- {r.name}: {r.distance_miles:.1f} mi, "
-            f"{r.elevation_gain_ft:.0f} ft gain, {r.turn_count} turns, "
-            f"Safety: {r.safety_score:.0f}/100"
+            f"{r.name}: {r.distance_miles} mi, "
+            f"{r.turn_count} turns, safety {r.safety_score:.0f}/100"
         )
 
 
 # ------------------------------------------------------------------
-# 3. STAFFING ESTIMATION (rewritten to integrate with routes)
+# STAFFING LOGIC (CONSERVATIVE BY DESIGN)
 # ------------------------------------------------------------------
 
-def estimate_rest_stop_count(
-    route_distances_miles: Iterable[float],
-    ratios: StaffingRatios,
-    spacing_miles: int = StaffingRatios.rest_stop_spacing_miles,
-) -> int:
-    """Estimate the number of rest stops for a set of routes."""
-
-    distances = [dist for dist in route_distances_miles if dist > 0]
-    if not distances:
-        return 0
-
-    longest = max(distances)
-    if ratios.route_support_model == ROUTE_SUPPORT_SEPARATE:
-        return sum(max(1, math.ceil(dist / spacing_miles)) for dist in distances)
-
-    if ratios.route_support_model == ROUTE_SUPPORT_PARTIAL_OVERLAP:
-        overlap = compute_route_overlap_share(distances)
-        extra_distance = (sum(distances) - longest) * (1.0 - overlap) * 0.5
-        effective_distance = longest + extra_distance
-        return max(1, math.ceil(effective_distance / spacing_miles))
-
-    return max(1, math.ceil(longest / spacing_miles))
-
-
-def estimate_sag_vehicles(
-    total_riders: int, routes: List[RouteCandidate], ratios: StaffingRatios
-) -> int:
-    """Estimate SAG vehicles needed for the event."""
-
-    base_sag = max(1, math.ceil(total_riders / ratios.riders_per_sag))
-    long_route_count = sum(
-        1 for r in routes if r.distance_miles >= ratios.long_route_threshold_miles
-    )
-
-    route_count = len(routes)
-    if ratios.route_support_model == ROUTE_SUPPORT_SEPARATE:
-        corridor_factor = 1.0 + 0.25 * max(0, route_count - 1)
-    elif ratios.route_support_model == ROUTE_SUPPORT_PARTIAL_OVERLAP:
-        overlap = compute_route_overlap_share([r.distance_miles for r in routes])
-        corridor_factor = 1.0 + (1.0 - overlap) * 0.25 * max(0, route_count - 1)
-    else:
-        corridor_factor = 1.0
-
-    support_sag = math.ceil(base_sag * corridor_factor)
-    return max(1, support_sag + long_route_count * ratios.sag_per_long_route)
-
-
-def estimate_mechanics(
-    total_riders: int, sag_vehicles: int, ratios: StaffingRatios
-) -> Tuple[int, int, int]:
-    """Estimate hub and roving mechanics based on riders and SAG vehicles."""
-
-    hub_mechanics = max(1, math.ceil(total_riders / ratios.riders_per_mechanic))
-    roving_mechanics = math.ceil(sag_vehicles / 2)
-    return hub_mechanics, roving_mechanics, hub_mechanics + roving_mechanics
-
-
-def estimate_signage_teams(
-    routes: List[RouteCandidate], ratios: StaffingRatios
-) -> int:
-    """Estimate the number of signage teams needed."""
-
-    if not routes:
-        return 1
-
-    turns = [r.turn_count for r in routes]
-    max_turns = max(turns)
-    total_turns = sum(turns)
-
-    if ratios.route_support_model == ROUTE_SUPPORT_SEPARATE:
-        signage_turns = total_turns
-    elif ratios.route_support_model == ROUTE_SUPPORT_PARTIAL_OVERLAP:
-        overlap = compute_route_overlap_share([r.distance_miles for r in routes])
-        signage_turns = max_turns + int(round((total_turns - max_turns) * (1.0 - overlap)))
-    else:
-        signage_turns = max_turns
-
-    return max(1, math.ceil(signage_turns / ratios.turns_per_signage_team))
-
-
 def select_representative_routes(routes: List[RouteCandidate]) -> List[RouteCandidate]:
-    """Pick the actual final route for each target distance.
+    """
+    Select the most demanding route per distance.
 
-    For planning, choose the most demanding candidate per distance so support
-    is sized for the worst-case selected course.
+    This ensures staffing is sized for worst-case complexity,
+    avoiding under-support.
+    """
+    by_distance: dict[float, RouteCandidate] = {}
+    for r in routes:
+        if (
+            r.distance_miles not in by_distance
+            or r.turn_count > by_distance[r.distance_miles].turn_count
+        ):
+            by_distance[r.distance_miles] = r
+    return list(by_distance.values())
+
+
+def estimate_rest_stop_staffing(
+    route_distances: Iterable[float],
+    ratios: StaffingRatios,
+) -> tuple[int, int]:
+    """
+    Shared rest-stop staffing model.
+
+    • Physical stop count is based on the longest route
+    • Early stops serve more routes and require more volunteers
+    • Later stops serve fewer routes and are right-sized
     """
 
-    best_by_distance: dict[float, RouteCandidate] = {}
-    for route in routes:
-        existing = best_by_distance.get(route.distance_miles)
-        if existing is None or route.turn_count > existing.turn_count:
-            best_by_distance[route.distance_miles] = route
-    return [best_by_distance[dist] for dist in sorted(best_by_distance)]
-
-
-def compute_route_overlap_share(route_distances_miles: Iterable[float]) -> float:
-    """Estimate how much support can be shared across multiple routes."""
-
-    distances = [dist for dist in route_distances_miles if dist > 0]
-    if not distances:
-        return 1.0
+    distances = sorted(route_distances)
     longest = max(distances)
-    return min(1.0, sum(distances) / (len(distances) * longest))
+    spacing = ratios.rest_stop_spacing_miles
 
+    physical_stops = max(1, math.ceil(longest / spacing))
 
-def estimate_registration_volunteers(
-    total_riders: int, routes: List[RouteCandidate], ratios: StaffingRatios
-) -> int:
-    """Estimate registration volunteers based on staggered start waves.
+    total_volunteers = 0
+    total_leads = 0
 
-    Longer routes start first and registration opens two hours before the
-    first ride, which spreads arrivals and lowers peak demand.
-    """
+    for stop_index in range(1, physical_stops + 1):
+        stop_mile = stop_index * spacing
+        routes_reaching = sum(1 for d in distances if d >= stop_mile)
 
-    if total_riders <= 0 or not routes:
-        return 1
+        if routes_reaching >= 3:
+            volunteers = ratios.rest_stop_volunteers_per_stop
+        elif routes_reaching == 2:
+            volunteers = max(3, ratios.rest_stop_volunteers_per_stop - 1)
+        else:
+            volunteers = max(2, ratios.rest_stop_volunteers_per_stop - 2)
 
-    wave_count = len(routes)
-    registration_window_minutes = (
-        ratios.registration_lead_minutes
-        + ratios.route_start_spacing_minutes * max(0, wave_count - 1)
-        + ratios.registration_peak_window_minutes
-    )
-    arrival_rate_rps = total_riders / (registration_window_minutes * 60)
+        total_volunteers += volunteers
+        total_leads += ratios.rest_stop_leads_per_stop
 
-    station_capacity_rps = 1.0 / ratios.registration_seconds_per_rider
-    stations_needed = math.ceil(arrival_rate_rps / station_capacity_rps)
-    return max(1, stations_needed)
+    return total_leads, total_volunteers
 
 
 def estimate_staffing(
     total_riders: int, routes: List[RouteCandidate], ratios: StaffingRatios
 ) -> StaffingEstimate:
-    """Estimate overall staffing needs for an event given candidate routes."""
+    """
+    Estimate overall staffing requirements.
+
+    All calculations are conservative planning estimates.
+    """
 
     selected_routes = select_representative_routes(routes)
-    sag_vehicles = estimate_sag_vehicles(total_riders, selected_routes, ratios)
-    hub_mechanics, roving_mechanics, total_mechanics = estimate_mechanics(
-        total_riders, sag_vehicles, ratios
-    )
-    signage_teams = estimate_signage_teams(selected_routes, ratios)
+    distances = [r.distance_miles for r in selected_routes]
 
-    rest_stop_count = estimate_rest_stop_count(
-        [r.distance_miles for r in selected_routes], ratios
+    sag_vehicles = max(
+        1,
+        math.ceil(total_riders / ratios.riders_per_sag)
+        + sum(1 for d in distances if d >= ratios.long_route_threshold_miles),
     )
-    rest_stop_volunteers = rest_stop_count * ratios.rest_stop_volunteers_per_stop
-    rest_stop_leads = rest_stop_count * ratios.rest_stop_leads_per_stop
 
-    registration_volunteers = estimate_registration_volunteers(
-        total_riders, selected_routes, ratios
+    hub_mechanics = max(1, math.ceil(total_riders / ratios.riders_per_mechanic))
+    roving_mechanics = math.ceil(sag_vehicles / 2)
+
+    signage_teams = max(
+        1,
+        math.ceil(max(r.turn_count for r in selected_routes) / ratios.turns_per_signage_team),
     )
+
+    rest_stop_leads, rest_stop_volunteers = estimate_rest_stop_staffing(
+        distances, ratios
+    )
+
+    registration_window_minutes = (
+        ratios.registration_lead_minutes
+        + ratios.route_start_spacing_minutes * (len(distances) - 1)
+        + ratios.registration_peak_window_minutes
+    )
+
+    arrival_rate = total_riders / (registration_window_minutes * 60)
+    station_capacity = 1.0 / ratios.registration_seconds_per_rider
+    registration_volunteers = max(1, math.ceil(arrival_rate / station_capacity))
 
     return StaffingEstimate(
         sag_vehicles=sag_vehicles,
         mechanics_hub=hub_mechanics,
         mechanics_roving=roving_mechanics,
-        total_mechanics=total_mechanics,
+        total_mechanics=hub_mechanics + roving_mechanics,
         signage_teams=signage_teams,
         rest_stop_leads=rest_stop_leads,
         rest_stop_volunteers=rest_stop_volunteers,
@@ -385,31 +387,30 @@ def estimate_staffing(
     )
 
 
-def print_staffing_estimate(estimate: StaffingEstimate) -> None:
-    print("\n=== STAFFING ESTIMATE ===")
-    print(f"SAG vehicles:              {estimate.sag_vehicles}")
-    print(f"Mechanics (hub):           {estimate.mechanics_hub}")
-    print(f"Mechanics (roving):        {estimate.mechanics_roving}")
-    print(f"Total mechanics:           {estimate.total_mechanics}")
-    print(f"Signage teams:             {estimate.signage_teams}")
-    print(f"Rest stop leads:           {estimate.rest_stop_leads}")
-    print(f"Rest stop volunteers:      {estimate.rest_stop_volunteers}")
-    print(f"Registration volunteers:   {estimate.registration_volunteers}")
-    print("==========================\n")
+def print_staffing_estimate(e: StaffingEstimate) -> None:
+    """Display staffing estimates with appropriate context."""
+    print("\n=== STAFFING ESTIMATE (PLANNING ONLY) ===")
+    print(f"SAG vehicles:            {e.sag_vehicles}")
+    print(f"Mechanics (hub):         {e.mechanics_hub}")
+    print(f"Mechanics (roving):      {e.mechanics_roving}")
+    print(f"Total mechanics:         {e.total_mechanics}")
+    print(f"Signage teams:           {e.signage_teams}")
+    print(f"Rest stop leads:         {e.rest_stop_leads}")
+    print(f"Rest stop volunteers:    {e.rest_stop_volunteers}")
+    print(f"Registration volunteers: {e.registration_volunteers}")
+    print("========================================\n")
 
 
 # ------------------------------------------------------------------
-# 4. MAIN PROGRAM / CLI
+# CLI
 # ------------------------------------------------------------------
 
 def main_menu() -> None:
-    """Interactive menu that connects route generation and staffing estimates."""
-
+    """Interactive entry point for planning use."""
     routes: List[RouteCandidate] = []
-    total_expected_riders: Optional[int] = None
 
     while True:
-        print("\n=== CYCLING EVENT PLANNER ===")
+        print("\n=== CYCLING EVENT PLANNER (PROTOTYPE) ===")
         print("1) Generate candidate routes")
         print("2) Estimate staffing & volunteers")
         print("3) Generate routes + estimate staffing")
@@ -422,44 +423,36 @@ def main_menu() -> None:
             routes = generate_candidate_routes(prefs)
             print_route_candidates(routes)
 
-        elif choice == "2":
+        elif choice in ("2", "3"):
+            if choice == "3":
+                prefs = build_route_preferences_from_user_input()
+                routes = generate_candidate_routes(prefs)
+                print_route_candidates(routes)
+
             if not routes:
-                print("\nNo routes available yet; generate routes first.\n")
+                print("Generate routes first.")
                 continue
 
-            total_expected_riders = prompt_int(
-                "Total expected riders (across all routes): "
-            )
-            ratios = StaffingRatios()
-            estimate = estimate_staffing(
-                total_expected_riders, routes, ratios
-            )
-            print_staffing_estimate(estimate)
+            while True:
+                riders = prompt_int("Total expected riders: ")
+                if riders > 0:
+                    break
+                print("Total riders must be greater than zero.")
 
-        elif choice == "3":
-            prefs = build_route_preferences_from_user_input()
-            routes = generate_candidate_routes(prefs)
-            print_route_candidates(routes)
-
-            total_expected_riders = prompt_int(
-                "Total expected riders (across all routes): "
-            )
-            ratios = StaffingRatios()
-            estimate = estimate_staffing(
-                total_expected_riders, routes, ratios
-            )
+            estimate = estimate_staffing(riders, routes, StaffingRatios())
             print_staffing_estimate(estimate)
 
         elif choice == "4":
-            print("\nGoodbye!\n")
+            print("Goodbye.")
             break
 
         else:
-            print("\nInvalid choice. Please try again.\n")
+            print("Invalid choice.")
 
 
 if __name__ == "__main__":
     main_menu()
+
 
 """ run success (Brookdale coordinates)
 Excellent news: the script executed successfully and produced route + staffing results for Brookdale. The program logic is working and this confirms the main functions are generating valid output.
