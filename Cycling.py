@@ -44,7 +44,7 @@ google_maps_client = googlemaps.Client(key=GOOGLE_MAPS_API_KEY)
 
 
 # ------------------------------------------------------------------
-# PLANNING HEURISTICS & ASSUMPTIONS
+# PLANNING HEURISTICS & 
 # ------------------------------------------------------------------
 
 ELEVATION_GAIN_PER_MILE_FT = 120.0  # Conservative heuristic
@@ -205,8 +205,137 @@ def classify_route_difficulty(
         return RouteDifficulty.EASY
     if distance_miles <= 40 and elevation_gain_ft <= 3500:
         return RouteDifficulty.MODERATE
+    return RouteDifficulty.CHALLENGING
 
 
+def generate_route_candidates(
+    preferences: RoutePreferences,
+    ratios: StaffingRatios,
+) -> List[RouteCandidate]:
+    """Create route candidates using simple planning heuristics."""
+    candidates: List[RouteCandidate] = []
+
+    for distance in preferences.target_distances_miles:
+        for variant in range(1, 4):
+            name = f"{int(distance)}mi {'Loop' if preferences.loop_preference else 'Out-and-Back'} Variant {variant}"
+            turn_count = max(6, int(distance * (2.5 + 0.4 * variant)))
+            elevation_gain_ft = estimate_elevation_gain_feet(distance)
+            difficulty = classify_route_difficulty(distance, elevation_gain_ft)
+            geometry_wkt = f"LINESTRING (0 0, {distance} 0)"
+
+            candidates.append(
+                RouteCandidate(
+                    name=name,
+                    distance_miles=distance,
+                    elevation_gain_ft=elevation_gain_ft,
+                    turn_count=turn_count,
+                    safety_score=max(50.0, BASE_SAFETY_SCORE - distance * SAFETY_SCORE_DISTANCE_PENALTY + (variant - 1) * SAFETY_SCORE_VARIANT_BONUS),
+                    difficulty=difficulty,
+                    geometry_wkt=geometry_wkt,
+                )
+            )
+
+    return candidates
+
+
+def estimate_staffing(
+    expected_riders: int,
+    route_candidates: List[RouteCandidate],
+    ratios: StaffingRatios,
+) -> StaffingEstimate:
+    """Estimate event staffing requirements."""
+    total_distance = sum(candidate.distance_miles for candidate in route_candidates)
+    total_turns = sum(candidate.turn_count for candidate in route_candidates)
+    rest_stops = max(1, math.ceil(total_distance / ratios.rest_stop_spacing_miles))
+
+    sag_vehicles = max(1, math.ceil(expected_riders / ratios.riders_per_sag))
+    mechanics_hub = max(1, math.ceil(expected_riders / ratios.riders_per_mechanic))
+    mechanics_roving = max(1, math.ceil(len(route_candidates) / 2))
+    signage_teams = max(1, math.ceil(total_turns / ratios.turns_per_signage_team))
+    rest_stop_leads = max(1, rest_stops * ratios.rest_stop_leads_per_stop)
+    rest_stop_volunteers = rest_stops * ratios.rest_stop_volunteers_per_stop
+    registration_volunteers = max(1, math.ceil(expected_riders * ratios.registration_seconds_per_rider / (ratios.registration_peak_window_minutes * 60)))
+
+    return StaffingEstimate(
+        sag_vehicles=sag_vehicles,
+        mechanics_hub=mechanics_hub,
+        mechanics_roving=mechanics_roving,
+        total_mechanics=mechanics_hub + mechanics_roving,
+        signage_teams=signage_teams,
+        rest_stop_leads=rest_stop_leads,
+        rest_stop_volunteers=rest_stop_volunteers,
+        registration_volunteers=registration_volunteers,
+    )
+
+
+def print_event_summary(
+    location: Location,
+    route_candidates: List[RouteCandidate],
+    staffing: StaffingEstimate,
+    expected_riders: int,
+) -> None:
+    print(f"\nEvent hub: {location.label}")
+    print(f"Address: {location.address}")
+    if location.lat is not None and location.lon is not None:
+        print(f"Coordinates: {location.lat:.6f}, {location.lon:.6f}")
+    print(f"Expected riders: {expected_riders}\n")
+
+    print("Route candidates:")
+    for candidate in route_candidates:
+        print(
+            f"- {candidate.name}: {candidate.distance_miles:.1f} miles, "
+            f"{candidate.elevation_gain_ft:.0f} ft gain, {candidate.difficulty.value}, "
+            f"safety {candidate.safety_score:.1f}, {candidate.turn_count} turns"
+        )
+
+    print("\nStaffing estimate:")
+    print(f"- SAG vehicles: {staffing.sag_vehicles}")
+    print(f"- Hub mechanics: {staffing.mechanics_hub}")
+    print(f"- Roving mechanics: {staffing.mechanics_roving}")
+    print(f"- Total mechanics: {staffing.total_mechanics}")
+    print(f"- Signage teams: {staffing.signage_teams}")
+    print(f"- Rest stop leads: {staffing.rest_stop_leads}")
+    print(f"- Rest stop volunteers: {staffing.rest_stop_volunteers}")
+    print(f"- Registration volunteers: {staffing.registration_volunteers}")
+
+
+def prompt_for_preferences() -> tuple[RoutePreferences, int]:
+    central_address = input("Enter central event location/address: ").strip()
+    if not central_address:
+        raise SystemExit("No address entered. Exiting.")
+
+    target_input = input("Enter target distances in miles (comma-separated, default 10,25,50): ").strip()
+    if target_input:
+        distances = [float(item) for item in target_input.split(",") if item.strip()]
+    else:
+        distances = [10.0, 25.0, 50.0]
+
+    riders_input = input("Enter expected rider count (default 250): ").strip()
+    expected_riders = int(riders_input) if riders_input else 250
+
+    loop_input = input("Prefer loop routes? (y/n, default y): ").strip().lower()
+    loop_preference = loop_input != "n"
+
+    return (
+        RoutePreferences(
+            central_location=Location(label="Central Hub", address=central_address),
+            target_distances_miles=distances,
+            loop_preference=loop_preference,
+            max_elevation_gain_ft=None,
+            allow_unpaved=False,
+            max_speed_limit_mph=None,
+            max_arterial_pct=None,
+        ),
+        expected_riders,
+    )
+
+
+if __name__ == "__main__":
+    preferences, expected_riders = prompt_for_preferences()
+    central_location = geocode_location_if_needed(preferences.central_location)
+    route_candidates = generate_route_candidates(preferences, StaffingRatios())
+    staffing = estimate_staffing(expected_riders, route_candidates, StaffingRatios())
+    print_event_summary(central_location, route_candidates, staffing, expected_riders)
 
 """ run success (Brookdale coordinates)
 Excellent news: the script executed successfully and produced route + staffing results for Brookdale. The program logic is working and this confirms the main functions are generating valid output.
