@@ -1,16 +1,12 @@
 {
   "version": "0.2.0",
   "configurations": [
-    
     {
       "name": "Python: Cycling",
       "type": "python",
       "request": "launch",
       "program": "${workspaceFolder}/Cycling.py",
-      "console": "integratedTerminal",
-      "env": {
-        "GOOGLE_MAPS_API_KEY": "AIzaSyB3SOsx4dwp1BdmovxkRt9VK1oiYAtE6dw"
-      }
+      "console": "integratedTerminal"
     }
   ]
 }

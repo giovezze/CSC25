@@ -50,6 +50,16 @@ google_maps_client = googlemaps.Client(key=GOOGLE_MAPS_API_KEY)
 
 ELEVATION_GAIN_PER_MILE_FT = 120.0  # Conservative heuristic
 
+MIN_DISTANCE_MILES = 1.0
+MAX_DISTANCE_MILES = 200.0
+MAX_ROUTE_DISTANCES = 5
+MAX_ROUTE_VARIANTS_PER_DISTANCE = 3
+MAX_ROUTE_CANDIDATES = 12
+DEFAULT_TARGET_DISTANCES = [10.0, 25.0, 50.0]
+MIN_EXPECTED_RIDERS = 1
+MAX_EXPECTED_RIDERS = 2000
+MAX_ADDRESS_LENGTH = 200
+
 BASE_SAFETY_SCORE = 90.0
 SAFETY_SCORE_DISTANCE_PENALTY = 0.2
 SAFETY_SCORE_VARIANT_BONUS = 2.0
@@ -93,6 +103,7 @@ class RoutePreferences:
 class RouteCandidate:
     name: str
     distance_miles: float
+    actual_distance_miles: float
     elevation_gain_ft: float
     turn_count: int
     safety_score: float
@@ -210,6 +221,49 @@ def classify_route_difficulty(
     return RouteDifficulty.CHALLENGING
 
 
+def parse_target_distances(target_input: str) -> List[float]:
+    distances: List[float] = []
+    for item in target_input.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            distance = float(item)
+        except ValueError:
+            raise ValueError(f"Invalid distance value: '{item}'")
+
+        if distance < MIN_DISTANCE_MILES or distance > MAX_DISTANCE_MILES:
+            raise ValueError(
+                f"Distance must be between {MIN_DISTANCE_MILES} and {MAX_DISTANCE_MILES} miles: {distance}"
+            )
+        distances.append(distance)
+
+    if not distances:
+        raise ValueError("No valid distances provided.")
+    if len(distances) > MAX_ROUTE_DISTANCES:
+        raise ValueError(
+            f"At most {MAX_ROUTE_DISTANCES} target distances are allowed."
+        )
+
+    return distances
+
+
+def parse_expected_riders(riders_input: str) -> int:
+    if not riders_input:
+        return 250
+    try:
+        expected_riders = int(riders_input)
+    except ValueError:
+        raise ValueError("Expected rider count must be an integer.")
+
+    if expected_riders < MIN_EXPECTED_RIDERS or expected_riders > MAX_EXPECTED_RIDERS:
+        raise ValueError(
+            f"Expected riders must be between {MIN_EXPECTED_RIDERS} and {MAX_EXPECTED_RIDERS}."
+        )
+
+    return expected_riders
+
+
 def compute_route_destination(origin: Location, distance_miles: float, variant: int) -> Location:
     """Create an approximate destination coordinate for a candidate route."""
     bearings = [45, 135, 225, 315]
@@ -218,16 +272,24 @@ def compute_route_destination(origin: Location, distance_miles: float, variant: 
     delta_lon = distance_miles * math.sin(math.radians(bearing)) / (69.0 * math.cos(math.radians(origin.lat)))
     lat = origin.lat + delta_lat
     lon = origin.lon + delta_lon
+
+    # Reverse geocode to get a valid address on a road
+    reverse_results = google_maps_client.reverse_geocode((lat, lon))
+    if reverse_results:
+        address = reverse_results[0]["formatted_address"]
+    else:
+        address = f"{lat:.6f},{lon:.6f}"
+
     return Location(
         label=f"Route Endpoint {variant}",
-        address=f"{lat:.6f},{lon:.6f}",
+        address=address,
         lat=lat,
         lon=lon,
     )
 
 
-def get_directions_instructions(origin: Location, destination: Location) -> List[str]:
-    """Use the Directions API to get real road instructions."""
+def get_directions_instructions(origin: Location, destination: Location, is_loop: bool = False) -> tuple[List[str], float]:
+    """Use the Directions API to get real road instructions and total distance."""
     origin_text = f"{origin.lat},{origin.lon}"
     destination_text = f"{destination.lat},{destination.lon}"
     results = google_maps_client.directions(
@@ -236,16 +298,38 @@ def get_directions_instructions(origin: Location, destination: Location) -> List
         mode="bicycling",
     )
     if not results:
-        return []
+        return [], 0.0
 
     instructions: List[str] = []
+    total_meters = 0
     for leg in results[0].get("legs", []):
+        total_meters += leg.get("distance", {}).get("value", 0)
         for step in leg.get("steps", []):
             html = step.get("html_instructions", "")
             text = re.sub(r"<.*?>", "", html)
             distance = step.get("distance", {}).get("text", "")
             instructions.append(f"{distance}    {text}")
-    return instructions
+
+    total_distance_miles = total_meters / 1609.34
+
+    if is_loop:
+        # For loops, add the return leg
+        return_results = google_maps_client.directions(
+            destination_text,
+            origin_text,
+            mode="bicycling",
+        )
+        if return_results:
+            for leg in return_results[0].get("legs", []):
+                total_meters += leg.get("distance", {}).get("value", 0)
+                for step in leg.get("steps", []):
+                    html = step.get("html_instructions", "")
+                    text = re.sub(r"<.*?>", "", html)
+                    distance = step.get("distance", {}).get("text", "")
+                    instructions.append(f"{distance}    {text}")
+            total_distance_miles = total_meters / 1609.34
+
+    return instructions, total_distance_miles
 
 
 def generate_route_candidates(
@@ -256,10 +340,14 @@ def generate_route_candidates(
     candidates: List[RouteCandidate] = []
 
     for distance in preferences.target_distances_miles:
-        for variant in range(1, 4):
+        for variant in range(1, MAX_ROUTE_VARIANTS_PER_DISTANCE + 1):
+            if len(candidates) >= MAX_ROUTE_CANDIDATES:
+                break
+
             name = f"{int(distance)}mi {'Loop' if preferences.loop_preference else 'Out-and-Back'} Variant {variant}"
-            destination = compute_route_destination(preferences.central_location, distance * 0.4, variant)
-            instructions = get_directions_instructions(preferences.central_location, destination)
+            destination_distance = distance * 0.4
+            destination = compute_route_destination(preferences.central_location, destination_distance, variant)
+            instructions, actual_distance = get_directions_instructions(preferences.central_location, destination, preferences.loop_preference)
             turn_count = max(3, len(instructions))
             elevation_gain_ft = estimate_elevation_gain_feet(distance)
             difficulty = classify_route_difficulty(distance, elevation_gain_ft)
@@ -269,6 +357,7 @@ def generate_route_candidates(
                 RouteCandidate(
                     name=name,
                     distance_miles=distance,
+                    actual_distance_miles=actual_distance,
                     elevation_gain_ft=elevation_gain_ft,
                     turn_count=turn_count,
                     safety_score=max(50.0, BASE_SAFETY_SCORE - distance * SAFETY_SCORE_DISTANCE_PENALTY + (variant - 1) * SAFETY_SCORE_VARIANT_BONUS),
@@ -277,6 +366,9 @@ def generate_route_candidates(
                     destination=destination,
                 )
             )
+
+        if len(candidates) >= MAX_ROUTE_CANDIDATES:
+            break
 
     return candidates
 
@@ -326,7 +418,7 @@ def print_event_summary(
     print("Route candidates:")
     for candidate in route_candidates:
         print(
-            f"- {candidate.name}: {candidate.distance_miles:.1f} miles, "
+            f"- {candidate.name}: {candidate.actual_distance_miles:.1f} miles, "
             f"{candidate.elevation_gain_ft:.0f} ft gain, {candidate.difficulty.value}, "
             f"safety {candidate.safety_score:.1f}, {candidate.turn_count} turns"
         )
@@ -348,7 +440,7 @@ def format_route_cue_sheet(route_candidate: RouteCandidate) -> List[str]:
     weights = [1.4, 1.0, 1.2, 0.8, 1.3, 0.9]
     weights = [weights[i % len(weights)] for i in range(segment_count)]
     total_weight = sum(weights)
-    segment_distances = [route_candidate.distance_miles * w / total_weight for w in weights]
+    segment_distances = [route_candidate.actual_distance_miles * w / total_weight for w in weights]
 
     streets = [
         "Holmdel Road",
@@ -371,22 +463,24 @@ def format_route_cue_sheet(route_candidate: RouteCandidate) -> List[str]:
         "Slight left",
     ]
 
+    cumulative = 0.0
     lines = [
-        f"Cue sheet for {route_candidate.name} ({route_candidate.distance_miles:.1f} mi, {route_candidate.turn_count} turns)",
-        f"Start on {streets[0]}.",
+        f"Cue sheet for {route_candidate.name} ({route_candidate.actual_distance_miles:.1f} mi, {route_candidate.turn_count} turns)",
+        f"{cumulative:.1f}    Start on {streets[0]}.",
     ]
 
     for i in range(route_candidate.turn_count):
+        seg_dist = segment_distances[i]
         street = streets[(i + 1) % len(streets)]
         direction = turn_directions[i % len(turn_directions)]
-        distance = segment_distances[i]
         lines.append(
-            f"{distance:.2f} miles    {direction} turn onto {street}"
+            f"{cumulative:.1f}    {seg_dist:.2f} mi    {direction} turn onto {street}"
         )
+        cumulative += seg_dist
 
     final_street = streets[(route_candidate.turn_count + 1) % len(streets)]
-    final_distance = segment_distances[-1]
-    lines.append(f"{final_distance:.2f} miles    Finish on {final_street}")
+    final_seg_dist = segment_distances[-1]
+    lines.append(f"{cumulative:.1f}    {final_seg_dist:.2f} mi    Finish on {final_street}")
     return lines
 
 
@@ -396,7 +490,7 @@ def prompt_for_cue_sheet(origin: Location, route_candidates: List[RouteCandidate
 
     print("\nAvailable routes for cue sheet:")
     for index, candidate in enumerate(route_candidates, start=1):
-        print(f"{index}. {candidate.name} ({candidate.distance_miles:.1f} mi, {candidate.turn_count} turns)")
+        print(f"{index}. {candidate.name} ({candidate.actual_distance_miles:.1f} mi, {candidate.turn_count} turns)")
 
     choice = input("Enter route number for a cue sheet (or press Enter to skip): ").strip()
     if not choice:
@@ -410,11 +504,20 @@ def prompt_for_cue_sheet(origin: Location, route_candidates: List[RouteCandidate
     print()  # blank line before cue sheet
 
     if selected.destination is not None:
-        directions = get_directions_instructions(origin, selected.destination)
+        is_loop = 'Loop' in selected.name
+        directions, _ = get_directions_instructions(origin, selected.destination, is_loop)
         if directions:
-            print(f"Cue sheet for {selected.name} ({selected.distance_miles:.1f} mi, {len(directions)} steps)")
+            print(f"Cue sheet for {selected.name} ({selected.actual_distance_miles:.1f} mi, {len(directions)} steps)")
+            cumulative = 0.0
             for line in directions:
-                print(line)
+                match = re.match(r"([0-9.]+) mi\s+(.+)", line)
+                if match:
+                    seg_dist = float(match.group(1))
+                    text = match.group(2)
+                    print(f"{cumulative:.1f}    {seg_dist:.1f} mi    {text}")
+                    cumulative += seg_dist
+                else:
+                    print(f"{cumulative:.1f}    {line}")
             return
 
     for line in format_route_cue_sheet(selected):
@@ -425,15 +528,26 @@ def prompt_for_preferences() -> tuple[RoutePreferences, int]:
     central_address = input("Enter central event location/address: ").strip()
     if not central_address:
         raise SystemExit("No address entered. Exiting.")
+    if len(central_address) > MAX_ADDRESS_LENGTH:
+        raise SystemExit(
+            f"Address is too long; please limit to {MAX_ADDRESS_LENGTH} characters."
+        )
 
     target_input = input("Enter target distances in miles (comma-separated, default 10,25,50): ").strip()
-    if target_input:
-        distances = [float(item) for item in target_input.split(",") if item.strip()]
-    else:
-        distances = [10.0, 25.0, 50.0]
+    try:
+        distances = (
+            parse_target_distances(target_input)
+            if target_input
+            else DEFAULT_TARGET_DISTANCES
+        )
+    except ValueError as exc:
+        raise SystemExit(f"Invalid distances: {exc}")
 
     riders_input = input("Enter expected rider count (default 250): ").strip()
-    expected_riders = int(riders_input) if riders_input else 250
+    try:
+        expected_riders = parse_expected_riders(riders_input)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid rider count: {exc}")
 
     loop_input = input("Prefer loop routes? (y/n, default y): ").strip().lower()
     loop_preference = loop_input != "n"
