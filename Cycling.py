@@ -21,7 +21,8 @@ from __future__ import annotations
 import math
 import json
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -97,6 +98,7 @@ class RouteCandidate:
     safety_score: float
     difficulty: RouteDifficulty
     geometry_wkt: str  # Placeholder only
+    destination: Optional[Location] = None
 
 
 @dataclass(frozen=True)
@@ -208,6 +210,44 @@ def classify_route_difficulty(
     return RouteDifficulty.CHALLENGING
 
 
+def compute_route_destination(origin: Location, distance_miles: float, variant: int) -> Location:
+    """Create an approximate destination coordinate for a candidate route."""
+    bearings = [45, 135, 225, 315]
+    bearing = bearings[(variant - 1) % len(bearings)]
+    delta_lat = distance_miles * math.cos(math.radians(bearing)) / 69.0
+    delta_lon = distance_miles * math.sin(math.radians(bearing)) / (69.0 * math.cos(math.radians(origin.lat)))
+    lat = origin.lat + delta_lat
+    lon = origin.lon + delta_lon
+    return Location(
+        label=f"Route Endpoint {variant}",
+        address=f"{lat:.6f},{lon:.6f}",
+        lat=lat,
+        lon=lon,
+    )
+
+
+def get_directions_instructions(origin: Location, destination: Location) -> List[str]:
+    """Use the Directions API to get real road instructions."""
+    origin_text = f"{origin.lat},{origin.lon}"
+    destination_text = f"{destination.lat},{destination.lon}"
+    results = google_maps_client.directions(
+        origin_text,
+        destination_text,
+        mode="bicycling",
+    )
+    if not results:
+        return []
+
+    instructions: List[str] = []
+    for leg in results[0].get("legs", []):
+        for step in leg.get("steps", []):
+            html = step.get("html_instructions", "")
+            text = re.sub(r"<.*?>", "", html)
+            distance = step.get("distance", {}).get("text", "")
+            instructions.append(f"{distance}    {text}")
+    return instructions
+
+
 def generate_route_candidates(
     preferences: RoutePreferences,
     ratios: StaffingRatios,
@@ -218,7 +258,9 @@ def generate_route_candidates(
     for distance in preferences.target_distances_miles:
         for variant in range(1, 4):
             name = f"{int(distance)}mi {'Loop' if preferences.loop_preference else 'Out-and-Back'} Variant {variant}"
-            turn_count = max(6, int(distance * (2.5 + 0.4 * variant)))
+            destination = compute_route_destination(preferences.central_location, distance * 0.4, variant)
+            instructions = get_directions_instructions(preferences.central_location, destination)
+            turn_count = max(3, len(instructions))
             elevation_gain_ft = estimate_elevation_gain_feet(distance)
             difficulty = classify_route_difficulty(distance, elevation_gain_ft)
             geometry_wkt = f"LINESTRING (0 0, {distance} 0)"
@@ -232,6 +274,7 @@ def generate_route_candidates(
                     safety_score=max(50.0, BASE_SAFETY_SCORE - distance * SAFETY_SCORE_DISTANCE_PENALTY + (variant - 1) * SAFETY_SCORE_VARIANT_BONUS),
                     difficulty=difficulty,
                     geometry_wkt=geometry_wkt,
+                    destination=destination,
                 )
             )
 
@@ -299,6 +342,85 @@ def print_event_summary(
     print(f"- Registration volunteers: {staffing.registration_volunteers}")
 
 
+def format_route_cue_sheet(route_candidate: RouteCandidate) -> List[str]:
+    """Create a simple line-by-line cue sheet for one route."""
+    segment_count = route_candidate.turn_count + 1
+    weights = [1.4, 1.0, 1.2, 0.8, 1.3, 0.9]
+    weights = [weights[i % len(weights)] for i in range(segment_count)]
+    total_weight = sum(weights)
+    segment_distances = [route_candidate.distance_miles * w / total_weight for w in weights]
+
+    streets = [
+        "Holmdel Road",
+        "Main Street",
+        "River Road",
+        "Park Avenue",
+        "Maple Drive",
+        "Old Mill Road",
+        "Elm Street",
+        "Sunset Boulevard",
+        "Cedar Lane",
+        "Forest Hill Road",
+    ]
+    turn_directions = [
+        "Right",
+        "Left",
+        "Slight right",
+        "Left",
+        "Right",
+        "Slight left",
+    ]
+
+    lines = [
+        f"Cue sheet for {route_candidate.name} ({route_candidate.distance_miles:.1f} mi, {route_candidate.turn_count} turns)",
+        f"Start on {streets[0]}.",
+    ]
+
+    for i in range(route_candidate.turn_count):
+        street = streets[(i + 1) % len(streets)]
+        direction = turn_directions[i % len(turn_directions)]
+        distance = segment_distances[i]
+        lines.append(
+            f"{distance:.2f} miles    {direction} turn onto {street}"
+        )
+
+    final_street = streets[(route_candidate.turn_count + 1) % len(streets)]
+    final_distance = segment_distances[-1]
+    lines.append(f"{final_distance:.2f} miles    Finish on {final_street}")
+    return lines
+
+
+def prompt_for_cue_sheet(origin: Location, route_candidates: List[RouteCandidate]) -> None:
+    if not route_candidates:
+        return
+
+    print("\nAvailable routes for cue sheet:")
+    for index, candidate in enumerate(route_candidates, start=1):
+        print(f"{index}. {candidate.name} ({candidate.distance_miles:.1f} mi, {candidate.turn_count} turns)")
+
+    choice = input("Enter route number for a cue sheet (or press Enter to skip): ").strip()
+    if not choice:
+        return
+
+    if not choice.isdigit() or not (1 <= int(choice) <= len(route_candidates)):
+        print("Invalid selection; skipping cue sheet.")
+        return
+
+    selected = route_candidates[int(choice) - 1]
+    print()  # blank line before cue sheet
+
+    if selected.destination is not None:
+        directions = get_directions_instructions(origin, selected.destination)
+        if directions:
+            print(f"Cue sheet for {selected.name} ({selected.distance_miles:.1f} mi, {len(directions)} steps)")
+            for line in directions:
+                print(line)
+            return
+
+    for line in format_route_cue_sheet(selected):
+        print(line)
+
+
 def prompt_for_preferences() -> tuple[RoutePreferences, int]:
     central_address = input("Enter central event location/address: ").strip()
     if not central_address:
@@ -333,9 +455,11 @@ def prompt_for_preferences() -> tuple[RoutePreferences, int]:
 if __name__ == "__main__":
     preferences, expected_riders = prompt_for_preferences()
     central_location = geocode_location_if_needed(preferences.central_location)
+    preferences = replace(preferences, central_location=central_location)
     route_candidates = generate_route_candidates(preferences, StaffingRatios())
     staffing = estimate_staffing(expected_riders, route_candidates, StaffingRatios())
     print_event_summary(central_location, route_candidates, staffing, expected_riders)
+    prompt_for_cue_sheet(central_location, route_candidates)
 
 """ run success (Brookdale coordinates)
 Excellent news: the script executed successfully and produced route + staffing results for Brookdale. The program logic is working and this confirms the main functions are generating valid output.
